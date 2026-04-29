@@ -20,7 +20,7 @@ Throughout this document, `PYTHON` means the detected Python command.
 **You cannot run the setup wizard directly** — it requires interactive terminal input.
 
 Check if `~/.rds-skill/config.json` exists:
-- **If it exists:** Read it to confirm the connection details.
+- **If it exists:** Read it to discover the configured connections (the `connections` map and the `default` key).
 - **If it doesn't exist:** Tell the user to run the setup wizard in their terminal:
 
 > Run this in your terminal to configure the Aurora connection:
@@ -30,6 +30,30 @@ Check if `~/.rds-skill/config.json` exists:
 > (On Windows, use `python` instead of `python3`)
 
 Wait for the user to confirm setup is complete before running any queries.
+
+## Connection Selection
+
+The skill supports **multiple named connections** (e.g. prod, staging, local). Config shape:
+
+```json
+{
+  "default": "prod",
+  "connections": {
+    "prod": { "host": "...", "database": "main", "db_user": "...", "region": "eu-west-1", "profile": "...", "write_mode": "reject" },
+    "staging": { "...": "..." }
+  },
+  "python": "/usr/bin/python3"
+}
+```
+
+- Every script accepts `--connection NAME` to pick a specific connection.
+- Without `--connection`, scripts use the `default` connection.
+- To list connections: `PYTHON ${CLAUDE_SKILL_DIR}/scripts/setup.py --list`
+- To switch defaults: `PYTHON ${CLAUDE_SKILL_DIR}/scripts/setup.py --set-default NAME`
+- To remove one: `PYTHON ${CLAUDE_SKILL_DIR}/scripts/setup.py --remove NAME`
+- To add another: re-run `PYTHON ${CLAUDE_SKILL_DIR}/scripts/setup.py` (interactive — instruct the user to run it themselves).
+
+When the user mentions "prod" / "staging" / a specific cluster name, map that to the matching connection and pass `--connection NAME` on every script invocation. If they don't specify, use the default and mention which one you're using.
 
 ## Quick Reference
 
@@ -54,6 +78,7 @@ Wait for the user to confirm setup is complete before running any queries.
 | `--no-save` | Don't auto-save to ~/rds-exports/ |
 | `--save-sql` | Save the SQL query as a .sql file alongside results |
 | `--sql-file=PATH` | Read SQL from a file (query.py only) |
+| `--connection=NAME` | Pick a named connection from `~/.rds-skill/config.json` (defaults to the saved `default`) |
 | `--profile=NAME` | Override AWS profile |
 | `--host=HOST` | Override cluster endpoint |
 | `--database=NAME` | Override database |
@@ -321,19 +346,59 @@ PYTHON ${CLAUDE_SKILL_DIR}/scripts/analyze.py data.csv --hist=price
 
 ---
 
-## Read-Only Guardrails
+## Write-Mode Behaviour
 
-**Two layers of protection:**
+Each connection has a `write_mode` field (`reject` / `accept` / `ask` / `auto`) that controls whether non-read-only SQL is allowed. Read it from the connection's config entry **before** writing or running any SQL — your behaviour changes per mode.
 
-1. **You must validate** — before passing any SQL to `query.py`, verify the first keyword is in the allowlist.
+### Operation classification
 
-2. **`lib/client.py` enforces** — the script itself rejects non-allowlisted SQL before it reaches Aurora. Hard guardrail, cannot be bypassed.
+| Class | Examples |
+|---|---|
+| **Read** | `SELECT`, `WITH`, `SHOW`, `EXPLAIN`, `SET` |
+| **Low-risk write** | `INSERT INTO ... VALUES`, `INSERT INTO ... SELECT`, `UPDATE ... WHERE`, `DELETE ... WHERE`, `CREATE TABLE/VIEW/INDEX`, `COMMENT ON`, `ANALYZE`, `VACUUM` |
+| **High-risk write** | `DROP`, `TRUNCATE`, `UPDATE` without `WHERE`, `DELETE` without `WHERE`, `ALTER TABLE ... DROP`, `GRANT`, `REVOKE`, `CREATE OR REPLACE` on existing objects |
 
-**Allowed:** `SELECT`, `WITH`, `SHOW`, `EXPLAIN`, `SET`
+### Behaviour matrix
 
-**Blocked:** `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY`, `GRANT`, `REVOKE`, `CALL`, `EXECUTE`, `VACUUM`, `ANALYZE`
+| `write_mode` | Read | Low-risk write | High-risk write |
+|---|---|---|---|
+| `reject` | run | **script blocks** — refuse to even submit | **script blocks** |
+| `auto` | run | run | **stop and ask the user before submitting** |
+| `ask` | run | **stop and ask the user before submitting** | **stop and ask the user before submitting** |
+| `accept` | run | run | run (no prompt) |
 
-Multi-statement queries (`;` followed by another statement) are also blocked.
+### How to "stop and ask"
+
+When the matrix says to ask the user **before** running the query (this happens at the LLM level, not the script — by the time the script runs, the answer is already yes):
+
+1. Compose the SQL.
+2. Use the agent's structured-question tool if available — `AskUserQuestion` in Claude Code, equivalent prompt tools in Codex / Cursor / etc. — rather than free-text Q&A.
+3. The question must show:
+   - the SQL (formatted),
+   - the connection name + database,
+   - the target objects,
+   - a blast-radius estimate (rows affected, whether reversible).
+4. Only proceed on an explicit yes. On no, abort.
+
+Example confirm question for `DELETE FROM events WHERE created_at < '2024-01-01'` on the `prod` connection (write_mode = `auto`, low-risk because it has a WHERE):
+
+> *Connection `prod` is in `auto` mode and this is a low-risk write — running directly. (No confirmation needed.)*
+
+Example for `DELETE FROM events` (no WHERE) on the same connection:
+
+> *Connection `prod` (write_mode `auto`) — this is a high-risk write. Confirm before I run:*
+> ```sql
+> DELETE FROM events
+> ```
+> *Estimated rows affected: ~12.3M (entire table). Irreversible. Run? [yes / no]*
+
+### Multi-statement queries
+
+Multi-statement queries (`;` followed by another statement) are blocked **in all write modes** — that's an injection defence, not a read-only thing.
+
+### Defensive defaults
+
+If you can't determine the write_mode (config missing, malformed), assume `reject` and only run reads.
 
 ---
 

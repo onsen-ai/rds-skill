@@ -1,4 +1,4 @@
-"""Shared Aurora PostgreSQL client — config, args, IAM token generation, execute via psycopg2, read-only guard."""
+"""Shared Aurora PostgreSQL client — multi-connection config, args, IAM token generation, execute via psycopg2, write-mode-aware guard."""
 
 import argparse
 import json
@@ -17,15 +17,59 @@ except ImportError:
 CONFIG_DIR = Path.home() / ".rds-skill"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+WRITE_MODES = ("reject", "accept", "ask", "auto")
+DEFAULT_WRITE_MODE = "reject"
+
+CONNECTION_FIELDS = ("profile", "host", "port", "database", "db_user", "region", "write_mode")
+
 
 # --- Config ---
 
+def _empty_config():
+    return {"default": None, "connections": {}}
+
+
+def _is_legacy(config):
+    """A pre-multi-connection config has top-level connection fields and no `connections` key."""
+    return "connections" not in config and any(
+        config.get(k) for k in ("host", "database", "db_user")
+    )
+
+
+def _migrate_legacy(config):
+    """Wrap an old-shape single-connection config into the new shape."""
+    legacy = {k: config[k] for k in CONNECTION_FIELDS if k in config}
+    legacy.setdefault("write_mode", DEFAULT_WRITE_MODE)
+    new_config = {
+        "default": "main",
+        "connections": {"main": legacy},
+    }
+    # Preserve top-level non-connection fields (e.g. `python`)
+    for k, v in config.items():
+        if k in CONNECTION_FIELDS:
+            continue
+        if k in ("default", "connections"):
+            continue
+        new_config[k] = v
+    return new_config
+
+
 def load_config():
-    """Load saved config from ~/.rds-skill/config.json."""
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
-            return json.load(f)
-    return {}
+    """Load config from ~/.rds-skill/config.json. Migrates old single-connection shape transparently."""
+    if not CONFIG_FILE.exists():
+        return _empty_config()
+    with open(CONFIG_FILE) as f:
+        config = json.load(f)
+    if _is_legacy(config):
+        config = _migrate_legacy(config)
+        try:
+            save_config(config)
+        except OSError:
+            # Read-only filesystem or similar — keep the migrated config in memory
+            pass
+    config.setdefault("default", None)
+    config.setdefault("connections", {})
+    return config
 
 
 def save_config(config):
@@ -35,13 +79,59 @@ def save_config(config):
         json.dump(config, f, indent=2)
 
 
+def list_connections():
+    """Return a list of (name, is_default) tuples sorted by name."""
+    config = load_config()
+    default = config.get("default")
+    return sorted(
+        ((name, name == default) for name in config.get("connections", {})),
+        key=lambda x: x[0],
+    )
+
+
+def save_connection(name, conn, set_default=False):
+    """Save one connection. If `set_default` or it's the only connection, mark it as default."""
+    config = load_config()
+    config["connections"][name] = conn
+    if set_default or len(config["connections"]) == 1 or not config.get("default"):
+        config["default"] = name
+    save_config(config)
+    return config
+
+
+def remove_connection(name):
+    """Delete one connection. Returns the new config. Caller must handle default re-pointing."""
+    config = load_config()
+    if name not in config.get("connections", {}):
+        raise KeyError(name)
+    del config["connections"][name]
+    if config.get("default") == name:
+        # Pick any remaining connection as the new default, else None
+        remaining = sorted(config["connections"].keys())
+        config["default"] = remaining[0] if remaining else None
+    save_config(config)
+    return config
+
+
+def set_default_connection(name):
+    config = load_config()
+    if name not in config.get("connections", {}):
+        raise KeyError(name)
+    config["default"] = name
+    save_config(config)
+    return config
+
+
+# --- Args & resolution ---
+
 def add_connection_args(parser):
     """Add standard connection args to an argparse parser."""
-    parser.add_argument("--profile", help="AWS CLI profile")
-    parser.add_argument("--host", help="Aurora cluster writer endpoint")
+    parser.add_argument("--connection", help="Named connection from ~/.rds-skill/config.json (defaults to the saved default)")
+    parser.add_argument("--profile", help="AWS CLI profile (overrides connection)")
+    parser.add_argument("--host", help="Aurora cluster writer endpoint (overrides connection)")
     parser.add_argument("--port", type=int, help="Database port (default: 5432)")
-    parser.add_argument("--database", help="Database name")
-    parser.add_argument("--db-user", dest="db_user", help="Database user")
+    parser.add_argument("--database", help="Database name (overrides connection)")
+    parser.add_argument("--db-user", dest="db_user", help="Database user (overrides connection)")
     parser.add_argument("--format", choices=["txt", "csv", "json"], default="txt",
                         help="Output format (default: txt)")
     parser.add_argument("--save-format", dest="save_format", choices=["txt", "csv", "json"], default="csv",
@@ -58,8 +148,33 @@ def add_connection_args(parser):
 
 
 def resolve_config(args):
-    """Merge saved config with CLI args (CLI wins)."""
-    config = load_config()
+    """Resolve the active connection: pick named/default connection, apply CLI overrides, fill defaults.
+
+    Returns a flat dict carrying everything execute_query needs (including write_mode).
+
+    Backwards compatibility: if no saved connections exist and CLI overrides supply enough info
+    (host + database + db_user), build an ephemeral connection — preserves the old "pass everything
+    on the command line" workflow.
+    """
+    full = load_config()
+    connections = full.get("connections", {})
+
+    requested = getattr(args, "connection", None)
+    name = requested or full.get("default")
+
+    if requested and requested not in connections:
+        available = ", ".join(sorted(connections)) or "(none)"
+        print(f"ERROR: Connection '{requested}' not found. Available: {available}", file=sys.stderr)
+        sys.exit(1)
+
+    if name and name in connections:
+        config = dict(connections[name])
+        config["_connection_name"] = name
+    else:
+        # No saved connection — fall back to ephemeral CLI-only mode (pre-multi-connection behaviour)
+        config = {"_connection_name": None}
+
+    # CLI overrides
     if args.profile:
         config["profile"] = args.profile
     if args.host:
@@ -73,39 +188,61 @@ def resolve_config(args):
 
     missing = [k for k in ("host", "database", "db_user") if not config.get(k)]
     if missing:
-        print(f"ERROR: Missing connection parameter(s): {', '.join(missing)}", file=sys.stderr)
-        print(f"Run setup first: python {Path(__file__).resolve().parent.parent / 'setup.py'}", file=sys.stderr)
+        if connections:
+            available = ", ".join(sorted(connections))
+            print(f"ERROR: Missing connection parameter(s): {', '.join(missing)}.", file=sys.stderr)
+            print(f"Use --connection NAME (available: {available}) or pass --host/--database/--db-user.", file=sys.stderr)
+        else:
+            print(f"ERROR: Missing connection parameter(s): {', '.join(missing)}.", file=sys.stderr)
+            print(f"Run setup first: python {Path(__file__).resolve().parent.parent / 'setup.py'}", file=sys.stderr)
+            print(f"Or pass --host/--database/--db-user on the command line.", file=sys.stderr)
         sys.exit(1)
 
     config.setdefault("port", 5432)
     config.setdefault("region", "eu-west-1")
+    config.setdefault("write_mode", DEFAULT_WRITE_MODE)
+    if config["write_mode"] not in WRITE_MODES:
+        print(f"ERROR: Invalid write_mode '{config['write_mode']}'. "
+              f"Must be one of: {', '.join(WRITE_MODES)}", file=sys.stderr)
+        sys.exit(1)
     return config
 
 
-# --- Read-only guard ---
+# --- Write-mode guard ---
 
-ALLOWED_KEYWORDS = {"SELECT", "WITH", "SHOW", "EXPLAIN", "SET"}
+READ_ONLY_KEYWORDS = {"SELECT", "WITH", "SHOW", "EXPLAIN", "SET"}
 
 
-def validate_sql(sql):
-    """Validate that SQL is read-only. Raises ValueError if not."""
+def _strip_sql(sql):
     clean = re.sub(r"--[^\n]*", "", sql)
     clean = re.sub(r"/\*.*?\*/", "", clean, flags=re.DOTALL)
-    clean = clean.strip()
+    return clean.strip()
 
+
+def validate_sql(sql, write_mode=DEFAULT_WRITE_MODE):
+    """Validate SQL according to the connection's write_mode.
+
+    - reject:           only allow read-only keywords (SELECT/WITH/SHOW/EXPLAIN/SET)
+    - accept/ask/auto:  allow any single statement; the LLM is expected to gate writes via SKILL.md guidance
+    - all modes:        block multi-statement queries (injection defence)
+
+    Raises ValueError on rejection.
+    """
+    clean = _strip_sql(sql)
     if not clean:
         raise ValueError("Empty SQL statement")
 
     first_keyword = clean.split()[0].upper().rstrip("(")
 
-    if first_keyword not in ALLOWED_KEYWORDS:
+    if write_mode == "reject" and first_keyword not in READ_ONLY_KEYWORDS:
         raise ValueError(
-            f"Blocked statement type: {first_keyword}. "
-            f"Only read-only queries are allowed ({', '.join(sorted(ALLOWED_KEYWORDS))})"
+            f"Blocked: '{first_keyword}' is not allowed when the connection's write_mode is 'reject'. "
+            f"Allowed: {', '.join(sorted(READ_ONLY_KEYWORDS))}. "
+            f"To allow writes, re-run setup.py and set this connection's write_mode to accept/ask/auto."
         )
 
     if re.search(r";\s*[A-Za-z]", clean):
-        raise ValueError("Multi-statement queries are not allowed")
+        raise ValueError("Multi-statement queries are not allowed (injection defence — applies in all write_modes)")
 
 
 # --- IAM token generation ---
@@ -131,7 +268,7 @@ def _generate_auth_token(config):
 # --- Query execution ---
 
 def execute_query(sql, config, timeout=120, max_rows=1000):
-    """Execute a read-only query via psycopg2 with IAM auth token.
+    """Execute a SQL query via psycopg2 with IAM auth token, gated by the connection's write_mode.
 
     Returns (columns, rows, metadata) where:
       - columns: list of column name strings
@@ -142,7 +279,8 @@ def execute_query(sql, config, timeout=120, max_rows=1000):
         print("ERROR: psycopg2 is not installed. Run: pip install psycopg2-binary", file=sys.stderr)
         sys.exit(1)
 
-    validate_sql(sql)
+    write_mode = config.get("write_mode", DEFAULT_WRITE_MODE)
+    validate_sql(sql, write_mode=write_mode)
 
     token = _generate_auth_token(config)
 
@@ -167,7 +305,10 @@ def execute_query(sql, config, timeout=120, max_rows=1000):
             cur.execute(sql)
 
             if cur.description is None:
-                return [], [], {"duration_secs": time.time() - start, "total_rows": 0}
+                # Non-SELECT statement — commit so writes persist (relevant for accept/ask/auto modes)
+                conn.commit()
+                affected = cur.rowcount if cur.rowcount >= 0 else 0
+                return [], [], {"duration_secs": time.time() - start, "total_rows": affected}
 
             columns = [desc[0] for desc in cur.description]
             rows = []
