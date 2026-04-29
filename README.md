@@ -331,7 +331,7 @@ These need to be in place once per cluster — typically owned by your infra tea
 | IAM policy | `rds-db:connect` on the cluster + user ARN (above) |
 | Network reachability | VPN or peering — Aurora typically lives in private subnets |
 
-Step-by-step IAM-auth setup walkthrough: [iam-auth-setup-generic.md](iam-auth-setup-generic.md).
+Step-by-step IAM-auth setup walkthrough: [iam-auth-setup.md](iam-auth-setup.md).
 
 ### Defence in depth
 
