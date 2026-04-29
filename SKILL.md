@@ -165,6 +165,24 @@ open('/path/to/query.sql', 'w').write(sql.strip())
 PYTHON ${CLAUDE_SKILL_DIR}/scripts/query.py --sql-file="/path/to/query.sql" --save="/path/to/results.csv" --save-sql
 ```
 
+**Tip — reuse SQL files by replacing values:** When you already have a SQL file and just need to change specific values (e.g. rolling dates forward a week), use a one-liner to swap them without rewriting the whole file in the LLM context:
+
+*Mac/Linux — sed:*
+```bash
+sed "s/2026-03-15/2026-03-22/g; s/2026-03-21/2026-03-28/g" original_query.sql > query.sql
+```
+
+*Cross-platform — Python:*
+```bash
+PYTHON -c "open('query.sql','w').write(open('original_query.sql').read().replace('2026-03-15','2026-03-22').replace('2026-03-21','2026-03-28'))"
+```
+
+Then execute:
+```bash
+PYTHON ${CLAUDE_SKILL_DIR}/scripts/query.py --sql-file=query.sql --save="/path/to/results.csv" --save-sql
+```
+For templates with many replacements, named placeholders like `{{WC_START}}` can be used instead of literal dates.
+
 ### Formatting conventions
 
 ```sql
@@ -213,6 +231,31 @@ Key formatting rules:
 - `GROUP BY 1, 2, 3` positional references work in PostgreSQL
 - Use `ILIKE` for case-insensitive pattern matching
 - Use `::TYPE` for casting (e.g. `col::DATE`, `col::TEXT`, `col::NUMERIC`)
+
+### Generous commenting
+
+Every query must include comments that explain the **why**, not just the what. Treat SQL as documentation for the next person (or the next agent) who reads it.
+
+- **Header block** at the top of every query: purpose, sources, key assumptions, parameters
+- **Section separators** (dashed `--` lines) between logical blocks (e.g. between actuals, budget, pivot CTEs)
+- **Inline comments** on non-obvious expressions (e.g. customer estimation formulas, business rules, why a filter exists)
+- **CTE-level comments** explaining what each CTE produces and why it exists as a separate step
+
+```sql
+------------------------------------------------------------------------------------------------------------------------
+-- Weekly Sales Scorecard
+-- Purpose: Core trading metrics with TY/LP/LY comparisons and BU/LV variances
+-- Source:  fact_basket_items (actuals), fact_commercial_budget_all (BU)
+-- Params:  Change the date in the periods CTE to set the reporting period
+-- Notes:
+--   - Customer estimation done per channel first, then summed to total
+--   - BU/LV only have sales and margin — derivative ratios are actuals-only
+------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------
+-- ACTUALS: per channel for correct customer estimation
+------------------------------------------------------------------------------------------------------------------------
+```
 
 ---
 
@@ -336,6 +379,8 @@ order_date    TIMESTAMP  8500000     0           0.0       1825            2022-
 
 ### analyze.py — Local analytics (no Aurora)
 
+Analyze previously saved CSV/JSON files locally. No network access needed — great for follow-up analysis without hitting Aurora again.
+
 ```bash
 PYTHON ${CLAUDE_SKILL_DIR}/scripts/analyze.py ~/rds-exports/query-*.csv --describe
 PYTHON ${CLAUDE_SKILL_DIR}/scripts/analyze.py data.csv --sum=revenue
@@ -343,6 +388,8 @@ PYTHON ${CLAUDE_SKILL_DIR}/scripts/analyze.py data.csv --group-by=region --sum=s
 PYTHON ${CLAUDE_SKILL_DIR}/scripts/analyze.py data.csv --filter='year=2024' --sort=amount --desc --top=10
 PYTHON ${CLAUDE_SKILL_DIR}/scripts/analyze.py data.csv --hist=price
 ```
+
+Available operations: `--count`, `--describe`, `--sum=COL`, `--avg=COL`, `--min=COL`, `--max=COL`, `--median=COL`, `--group-by=COL`, `--filter=EXPR`, `--sort=COL`, `--desc`, `--top=N`, `--hist=COL`
 
 ---
 
@@ -416,3 +463,93 @@ This skill uses **AWS IAM database authentication** — no passwords or secrets 
 - DB user: `GRANT rds_iam TO rds_skill_user`
 - IAM policy: `rds-db:connect` on the cluster + user ARN
 - VPN: connected to corporate VPN to reach the DB endpoint
+
+---
+
+## Advanced SQL Templates
+
+For ad-hoc exploration via `query.py`. PostgreSQL system catalogs — no extensions or admin views required (except `pg_stat_statements` where noted).
+
+**Running queries:**
+```sql
+SELECT pid,
+       usename                                                       AS user_name,
+       datname                                                       AS db_name,
+       state,
+       query_start,
+       NOW() - query_start                                           AS duration,
+       LEFT(query, 200)                                              AS query_preview
+FROM   pg_stat_activity
+WHERE  state <> 'idle'
+       AND pid <> pg_backend_pid()
+ORDER  BY query_start
+```
+
+**Long-running / blocking queries:**
+```sql
+SELECT pid,
+       usename,
+       state,
+       wait_event_type,
+       wait_event,
+       NOW() - query_start                                           AS duration,
+       LEFT(query, 200)                                              AS query_preview
+FROM   pg_stat_activity
+WHERE  state = 'active'
+       AND NOW() - query_start > INTERVAL '30 seconds'
+ORDER  BY query_start
+```
+
+**Query history (requires `pg_stat_statements` extension):**
+```sql
+SELECT LEFT(query, 200)                                              AS sql,
+       calls,
+       ROUND(total_exec_time::NUMERIC, 1)                            AS total_ms,
+       ROUND(mean_exec_time::NUMERIC, 1)                             AS mean_ms,
+       ROUND((100 * total_exec_time / SUM(total_exec_time) OVER ())::NUMERIC, 1)  AS pct_of_total
+FROM   pg_stat_statements
+ORDER  BY total_exec_time DESC
+LIMIT  20
+```
+If `pg_stat_statements` isn't installed, this query will error with `relation "pg_stat_statements" does not exist` — that's a one-time install at the cluster level (`CREATE EXTENSION pg_stat_statements`).
+
+**Table dependencies (FK relationships):**
+```sql
+SELECT n1.nspname || '.' || c1.relname                               AS source_table,
+       n2.nspname || '.' || c2.relname                               AS referenced_table,
+       con.conname                                                    AS constraint_name
+FROM   pg_constraint con
+JOIN   pg_class c1     ON con.conrelid    = c1.oid
+JOIN   pg_namespace n1 ON c1.relnamespace = n1.oid
+JOIN   pg_class c2     ON con.confrelid   = c2.oid
+JOIN   pg_namespace n2 ON c2.relnamespace = n2.oid
+WHERE  con.contype = 'f'
+ORDER  BY source_table
+```
+
+**Index usage stats (which indexes are unused?):**
+```sql
+SELECT schemaname,
+       relname                                                       AS table_name,
+       indexrelname                                                  AS index_name,
+       idx_scan                                                      AS times_used,
+       pg_size_pretty(pg_relation_size(indexrelid))                  AS index_size
+FROM   pg_stat_user_indexes
+WHERE  schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER  BY idx_scan, pg_relation_size(indexrelid) DESC
+```
+
+**Table bloat estimate:**
+```sql
+SELECT schemaname,
+       relname                                                       AS table_name,
+       n_live_tup                                                    AS live_rows,
+       n_dead_tup                                                    AS dead_rows,
+       ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1)  AS dead_pct,
+       last_vacuum,
+       last_autovacuum
+FROM   pg_stat_user_tables
+WHERE  n_dead_tup > 0
+ORDER  BY n_dead_tup DESC
+LIMIT  20
+```
