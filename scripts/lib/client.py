@@ -323,6 +323,11 @@ def execute_query(sql, config, timeout=120, max_rows=1000):
 
             total_rows = cur.rowcount if cur.rowcount >= 0 else len(rows)
 
+            # Row-returning statements can still be writes (INSERT/UPDATE/DELETE ... RETURNING,
+            # or WITH clauses that modify data), so commit here too — otherwise they roll back
+            # when the connection closes. Committing after a plain SELECT has no effect.
+            conn.commit()
+
     except psycopg2.Error as e:
         raise RuntimeError(f"Query failed: {e}")
     finally:
