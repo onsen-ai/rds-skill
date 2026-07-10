@@ -294,7 +294,7 @@ def execute_query(sql, config, timeout=120, max_rows=1000):
             user=config["db_user"],
             password=token,
             sslmode="require",
-            connect_timeout=10,
+            connect_timeout=60,
             options=f"-c statement_timeout={timeout * 1000}",
         )
     except psycopg2.OperationalError as e:
