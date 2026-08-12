@@ -247,7 +247,7 @@ def validate_sql(sql, write_mode=DEFAULT_WRITE_MODE):
 
 # --- IAM token generation ---
 
-def _generate_auth_token(config):
+def generate_auth_token(config):
     """Generate a temporary IAM auth token via AWS CLI."""
     cmd = [
         "aws", "rds", "generate-db-auth-token",
@@ -282,7 +282,7 @@ def execute_query(sql, config, timeout=120, max_rows=1000):
     write_mode = config.get("write_mode", DEFAULT_WRITE_MODE)
     validate_sql(sql, write_mode=write_mode)
 
-    token = _generate_auth_token(config)
+    token = generate_auth_token(config)
 
     start = time.time()
 

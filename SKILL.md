@@ -60,6 +60,7 @@ When the user mentions "prod" / "staging" / a specific cluster name, map that to
 | Task | Script | When to use | Key Args |
 |------|--------|-------------|----------|
 | **Run SQL** | `query.py` | Any free-form read-only query | `"SELECT ..."` or `--sql-file=PATH` |
+| **Run a .sql file** | `run_file.py` | Apply a multi-statement file — migrations, DDL, backfills | `FILE --allow-write` |
 | **List schemas** | `schemas.py` | Starting point — see what schemas exist with table counts | |
 | **List tables** | `tables.py` | Browse tables, check row counts and sizes before querying | `--schema=NAME` |
 | **List columns** | `columns.py` | Understand column types, nullability, indexes | `--schema=NAME --table=NAME` |
@@ -315,6 +316,61 @@ PYTHON ${CLAUDE_SKILL_DIR}/scripts/query.py "SELECT count(1) FROM sales.orders"
 PYTHON ${CLAUDE_SKILL_DIR}/scripts/query.py --sql-file=~/rds-exports/my_query.sql
 ```
 
+### run_file.py — Run a .sql file
+
+For files `query.py` cannot take: migrations, DDL, backfills — anything with more than one
+statement, or with a DO block that COMMITs per batch.
+
+```bash
+PYTHON ${CLAUDE_SKILL_DIR}/scripts/run_file.py --dry-run migrations/add_search.sql
+PYTHON ${CLAUDE_SKILL_DIR}/scripts/run_file.py --allow-write --timing migrations/add_search.sql
+PYTHON ${CLAUDE_SKILL_DIR}/scripts/run_file.py --connection prod --allow-write --allow-prod migrations/add_search.sql
+```
+
+**Always `--dry-run` first** — it splits the file and lists the statements without connecting.
+Show that list to the user before running for real.
+
+| Option | Description |
+|--------|-------------|
+| `--allow-write` | Required when the connection's `write_mode` is `reject` |
+| `--allow-prod` | Required for any target other than the saved default connection |
+| `--dry-run` | Split and list statements, run nothing |
+| `--single-transaction` | All-or-nothing: wrap the file in one transaction, roll back on any failure |
+| `--timing` | Print every statement's duration (otherwise only statements over 1s) |
+| `--continue-on-error` | Keep going after a failed statement (default: stop) |
+
+What it does differently from `query.py`:
+
+- **Splits on top-level semicolons only** — dollar-quoted bodies, string literals, quoted
+  identifiers and comments are left intact. It is psql-lite, not psql: no `\` meta-commands, no
+  variable interpolation.
+- **One session, autocommit, no wrapping transaction.** Session-scoped state (`SET ROLE`, hypopg,
+  advisory locks) survives across statements, and a DO block may `COMMIT`.
+- **Prints `RAISE NOTICE` output** after each statement, so backfill progress is visible.
+- **Shows result rows** for statements that return them (first 50).
+
+**By default there is no rollback.** A failure at statement 40 leaves the first 39 committed. Say
+this to the user before running anything that isn't idempotent, and prefer files that can be re-run
+safely (`IF NOT EXISTS`, `CREATE OR REPLACE`, batched backfills with a resume condition).
+
+#### Choosing the transaction mode
+
+| | Default (autocommit) | `--single-transaction` |
+|---|---|---|
+| On failure | statements up to that point stay applied | whole file rolls back, including DDL |
+| Locks | released as each statement commits | every lock held until the file finishes |
+| `COMMIT` inside a DO block | works | fails |
+| `CREATE INDEX CONCURRENTLY`, `VACUUM` | works | fails |
+| Best for | batched backfills, long migrations, anything concurrent | short DDL sets that must land together |
+
+`--single-transaction` refuses to combine with `--continue-on-error` — once a statement fails the
+transaction is aborted, so every later statement fails anyway. Before running, it scans the file
+and warns about statements PostgreSQL will not allow inside a transaction block; that warning shows
+in `--dry-run` too, so you can check the mode is right without connecting.
+
+Pick the default for anything long or lock-sensitive on a busy table — holding every lock for the
+duration of a big migration is usually worse than a partial apply you can re-run.
+
 ### schemas.py — List schemas
 
 ```bash
@@ -442,6 +498,15 @@ Example for `DELETE FROM events` (no WHERE) on the same connection:
 ### Multi-statement queries
 
 Multi-statement queries (`;` followed by another statement) are blocked **in all write modes** — that's an injection defence, not a read-only thing.
+
+The one exception is `run_file.py`, which exists precisely to apply a multi-statement file. It is not a way around the guard: it runs a file you can point at and read, never inline SQL, and it is gated twice on top of `write_mode`:
+
+| Gate | Fires when | Flag to proceed |
+|---|---|---|
+| write | connection's `write_mode` is `reject` | `--allow-write` |
+| target | anything other than the saved default connection — a different named connection, an unsaved one, or a `--host`/`--database`/`--db-user`/`--port` override | `--allow-prod` |
+
+Both must pass. An unknown target is treated as production, so a newly added connection is protected until it is named explicitly. Neither flag is yours to add on the user's behalf — if a run refuses, show them the refusal and the file, and let them decide.
 
 ### Defensive defaults
 

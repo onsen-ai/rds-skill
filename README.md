@@ -116,6 +116,7 @@ That's it. All scripts auto-detect your default connection. 🎉
 | Script | What it does | Example |
 | ------ | ------------ | ------- |
 | `query.py` | Run SQL (read-only by default; writes gated by `write_mode`) | `query.py "SELECT ..."` or `query.py --sql-file=my.sql` |
+| `run_file.py` | Apply a multi-statement `.sql` file — migrations, DDL, backfills | `run_file.py --dry-run migration.sql` |
 | `profile.py` | Per-column stats (nulls, cardinality, min/max/avg) | `profile.py --schema=sales --table=customers` |
 | `analyze.py` | Local analytics on saved files — **no Aurora needed** | `analyze.py data.csv --describe` |
 
@@ -204,6 +205,31 @@ Every connection has a `write_mode` — set it during `setup.py`. The mode deter
 The script enforces only the `reject` floor — for `ask` / `auto`, the gating happens at the **agent level**: the AI agent (Claude / Codex / Cursor) is told via [SKILL.md](SKILL.md) to use its structured-question tool (e.g. Claude Code's `AskUserQuestion`) to confirm before submitting the query. This gives you a clean confirm/deny prompt instead of a chat exchange.
 
 > 💡 **Pick `reject` for prod, `auto` for staging, `accept` for local dev.** Multi-statement queries are blocked in **all** modes as an injection defence.
+
+### Running a .sql file
+
+`run_file.py` is the one deliberate exception to the multi-statement rule — migrations and backfills have to be applied somehow. It runs a file you can point at and read, never inline SQL, and it carries two gates of its own on top of `write_mode`:
+
+| Gate | Fires when | Flag |
+| ---- | ---------- | ---- |
+| write | the connection's `write_mode` is `reject` | `--allow-write` |
+| target | the target is anything but the saved **default** connection — a different named connection, an unsaved one, or a `--host` / `--database` / `--db-user` / `--port` override | `--allow-prod` |
+
+Both must pass, so an unknown target is protected by default: add a new connection and it stays off-limits until you name it explicitly. Start with `--dry-run`, which splits the file and lists the statements without connecting to anything.
+
+> ⚠️ **No rollback by default.** The file runs with autocommit on, one statement at a time, so a failure at statement 40 leaves the first 39 applied. That is deliberate — it is what lets a batched backfill `COMMIT` per batch and bound its lock duration — but it means you want re-runnable SQL (`IF NOT EXISTS`, `CREATE OR REPLACE`, backfills with a resume condition).
+
+Pass `--single-transaction` when you'd rather have all-or-nothing:
+
+| | Default (autocommit) | `--single-transaction` |
+| --- | --- | --- |
+| On failure | statements so far stay applied | whole file rolls back, DDL included |
+| Locks | released as each statement commits | every lock held until the file finishes |
+| `COMMIT` inside a `DO` block | works | fails |
+| `CREATE INDEX CONCURRENTLY`, `VACUUM` | works | fails |
+| Best for | batched backfills, long migrations | short DDL sets that must land together |
+
+It scans the file first and warns about anything PostgreSQL won't run inside a transaction block — visible under `--dry-run`, before it connects to anything. For a long migration on a busy table, prefer the default: holding every lock for the whole run usually hurts more than a partial apply you can re-run.
 
 ### Defensive query rules
 
