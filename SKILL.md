@@ -55,6 +55,8 @@ The skill supports **multiple named connections** (e.g. prod, staging, local). C
 
 When the user mentions "prod" / "staging" / a specific cluster name, map that to the matching connection and pass `--connection NAME` on every script invocation. If they don't specify, use the default and mention which one you're using.
 
+**Tunnels.** A connection may carry `"tunnel_port"` (and optionally `"tunnel_host"`, default `127.0.0.1`): a local port-forwarding tunnel to its endpoint, such as an SSM session through a bastion. The scripts then connect through the tunnel while still signing the IAM token for `host`:`port` (RDS binds a token to the port it was signed for). If nothing is listening on the tunnel port, they connect to `host` directly and print a `NOTE: no tunnel listening…` line on stderr — when that is followed by a timeout, tell the user to open the tunnel rather than debugging the query. `--host`/`--port` on the command line drop the tunnel. Never set `tunnel_host` to anything but a loopback address: the IAM token goes to whatever listens there.
+
 ## Quick Reference
 
 | Task | Script | When to use | Key Args |

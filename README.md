@@ -288,12 +288,29 @@ All results are **automatically saved** to `~/rds-exports/`:
 
 Edit directly or re-run `python3 scripts/setup.py`. Pre-multi-connection configs (top-level `host` / `database` / `db_user` and no `connections` key) are auto-migrated to this shape on first read.
 
+### Tunnels (optional)
+
+Instead of a VPN, a connection can go through a local port-forwarding tunnel — for example an AWS SSM session through a bastion (`aws ssm start-session --document-name AWS-StartPortForwardingSessionToRemoteHost …`). Add the local end to the connection:
+
+```json
+"prod": {
+  "host": "prod-cluster.cluster-xyz.eu-west-1.rds.amazonaws.com",
+  "port": 5432,
+  "tunnel_port": 15433,
+  "...": "..."
+}
+```
+
+The IAM token is still signed for `host`:`port` — RDS rejects a token signed for any other port — and only the TCP connection goes to `127.0.0.1:15433` (`tunnel_host` to change the address). `sslmode=require` does not check the hostname, so TLS works through the tunnel unchanged. If the tunnel is not open, the scripts connect to `host` directly and say so on stderr. `--host`/`--port` on the command line ignore the tunnel.
+
+> ⚠️ The IAM token (valid for 15 minutes) is sent to whatever listens on `tunnel_host`:`tunnel_port`, and `sslmode=require` does not verify who that is. Keep `tunnel_host` on the loopback address (the default) and only point `tunnel_port` at a tunnel you started yourself.
+
 ## 🧰 Prerequisites
 
 - **Python 3.8+**
 - **AWS CLI v2** — with a profile that has `rds-db:connect` permission on the cluster
 - **psycopg2-binary** — installed automatically by `setup.py`
-- **Network reachability** — typically corporate VPN, since Aurora endpoints sit in private subnets
+- **Network reachability** — a VPN or a port-forwarding tunnel (see [Tunnels](#tunnels-optional)), since Aurora endpoints sit in private subnets
 
 > 💡 On macOS use `python3`, on Windows use `python`. The setup wizard saves your Python path so the agent uses the right one automatically.
 

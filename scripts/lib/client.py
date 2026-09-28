@@ -3,6 +3,7 @@
 import argparse
 import json
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -20,7 +21,8 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 WRITE_MODES = ("reject", "accept", "ask", "auto")
 DEFAULT_WRITE_MODE = "reject"
 
-CONNECTION_FIELDS = ("profile", "host", "port", "database", "db_user", "region", "write_mode")
+CONNECTION_FIELDS = ("profile", "host", "port", "database", "db_user", "region", "write_mode",
+                     "tunnel_host", "tunnel_port")
 
 
 # --- Config ---
@@ -181,6 +183,10 @@ def resolve_config(args):
         config["host"] = args.host
     if args.port:
         config["port"] = args.port
+    if args.host or args.port:
+        # A saved tunnel leads to the saved endpoint, not to whatever the flags point at.
+        config.pop("tunnel_host", None)
+        config.pop("tunnel_port", None)
     if args.database:
         config["database"] = args.database
     if args.db_user:
@@ -265,6 +271,41 @@ def generate_auth_token(config):
     return result.stdout.strip()
 
 
+# --- Where to connect ---
+
+def _port_is_open(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def connect_target(config):
+    """Return (host, port) to dial for this connection.
+
+    A connection can name a local port-forwarding tunnel to its endpoint (`tunnel_port`, and
+    `tunnel_host`, default 127.0.0.1) — an SSM session through a bastion, for example. The IAM
+    token is still signed for `host`:`port`, because RDS binds a token to the port it was signed
+    for; only the TCP connection goes through the tunnel. TLS still works: sslmode=require does
+    not check the hostname.
+
+    When the tunnel is not open, fall back to the endpoint itself (reachable over a VPN, or not at
+    all), with a note on stderr, so a closed tunnel reads as that rather than as a mystery timeout.
+    """
+    tunnel_port = config.get("tunnel_port")
+    if tunnel_port:
+        tunnel_host = config.get("tunnel_host") or "127.0.0.1"
+        if _port_is_open(tunnel_host, int(tunnel_port)):
+            return tunnel_host, int(tunnel_port)
+        print(
+            f"NOTE: no tunnel listening on {tunnel_host}:{tunnel_port} for this connection; "
+            f"connecting to {config['host']} directly instead (needs a VPN).",
+            file=sys.stderr,
+        )
+    return config["host"], config.get("port", 5432)
+
+
 # --- Query execution ---
 
 def execute_query(sql, config, timeout=120, max_rows=1000):
@@ -283,13 +324,14 @@ def execute_query(sql, config, timeout=120, max_rows=1000):
     validate_sql(sql, write_mode=write_mode)
 
     token = generate_auth_token(config)
+    dial_host, dial_port = connect_target(config)
 
     start = time.time()
 
     try:
         conn = psycopg2.connect(
-            host=config["host"],
-            port=config.get("port", 5432),
+            host=dial_host,
+            port=dial_port,
             database=config["database"],
             user=config["db_user"],
             password=token,

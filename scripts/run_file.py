@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.client import load_config, resolve_config, generate_auth_token
+from lib.client import load_config, resolve_config, generate_auth_token, connect_target
 
 try:
     import psycopg2
@@ -204,9 +204,10 @@ def open_connection(config, single_transaction=False):
         sys.exit("ERROR: psycopg2 is not installed. Run: pip install psycopg2-binary")
 
     token = generate_auth_token(config)
+    dial_host, dial_port = connect_target(config)
     conn = psycopg2.connect(
-        host=config["host"],
-        port=config.get("port", 5432),
+        host=dial_host,
+        port=dial_port,
         dbname=config["database"],
         user=config["db_user"],
         password=token,

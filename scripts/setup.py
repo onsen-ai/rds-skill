@@ -20,6 +20,7 @@ from lib.client import (
     CONFIG_FILE,
     DEFAULT_WRITE_MODE,
     WRITE_MODES,
+    connect_target,
     load_config,
     remove_connection,
     save_config,
@@ -259,9 +260,10 @@ def test_connection(conn):
     print("  Connecting via psycopg2...")
     try:
         import psycopg2
+        dial_host, dial_port = connect_target(conn)
         c = psycopg2.connect(
-            host=conn["host"],
-            port=conn["port"],
+            host=dial_host,
+            port=dial_port,
             database=conn["database"],
             user=conn["db_user"],
             password=token,
